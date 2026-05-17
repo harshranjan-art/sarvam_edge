@@ -1,0 +1,35 @@
+%% System Overview — companion to PDF Figure 1
+%% Render with: mmdc -i system-overview.mmd -o system-overview.svg
+
+flowchart TB
+    subgraph CLIENT[CLIENT — browser]
+        SHELL[React Shell App<br/>owns SDK + scheduler]
+        DQA[Document Q&A MFE]
+        MEET[Meeting Summariser MFE]
+        DQA -->|consumes SDK| SHELL
+        MEET -->|consumes SDK| SHELL
+    end
+
+    subgraph AGENT[EDGE AGENT — native, user process]
+        SUP[Supervisor<br/><i>launcher · monitor · restarter</i><br/>~20 MB resident]
+        API[API Server<br/><i>HTTP + SSE · auth · routing</i><br/>~40 MB resident]
+        WORK[Inference Worker<br/><i>model · tokenizer · NPU calls</i><br/>~6 GB resident]
+        SUP -.->|spawn + heartbeat| API
+        SUP -.->|spawn + heartbeat| WORK
+        API -.->|jobs via named pipe / UDS| WORK
+    end
+
+    subgraph HW[HARDWARE]
+        NPU[Qualcomm NPU]
+        ANE[Apple Neural Engine]
+        GPU[Metal GPU]
+        CPU[CPU - Accelerate / DirectML]
+        CLOUD[Cloud - last resort]
+    end
+
+    SHELL -->|HTTP + SSE on 127.0.0.1| API
+    WORK --> NPU
+    WORK --> ANE
+    WORK --> GPU
+    WORK --> CPU
+    WORK -.->|opt-in only| CLOUD

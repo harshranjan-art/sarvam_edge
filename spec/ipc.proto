@@ -1,0 +1,218 @@
+// =====================================================================
+// Sarvam Edge Agent — internal IPC wire format
+// =====================================================================
+//
+// Used on the named-pipe (Windows) / Unix domain socket (macOS) channels
+// between Supervisor, API Server, and Inference Worker processes.
+//
+// Wire framing: length-prefixed protobuf. Each message is sent as
+//   [4-byte big-endian uint32 length][protobuf bytes]
+//
+// Why protobuf:
+//   - Schema-evolvable (new fields are ignorable)
+//   - Zero-copy decode possible for the token-streaming hot path
+//   - Language-agnostic — the agent's components could be re-implemented
+//     in Rust, Go, or C++ without changing this contract
+//
+// Why not JSON: at ~50 tokens/sec on the streaming path, JSON's per-message
+// allocation and parsing cost adds noticeable latency tail.
+//
+// =====================================================================
+
+syntax = "proto3";
+package sarvam.edge.ipc.v1;
+
+// =====================================================================
+// Envelope
+// =====================================================================
+//
+// Every IPC message is wrapped in this envelope. The discriminator field
+// (`payload`) is a oneof so the receiver can dispatch on type without
+// double-decoding.
+
+message Frame {
+  // Monotonic per-channel sequence number. Used for log correlation and
+  // to detect dropped frames (a hard error -- we tear down the channel).
+  uint64 seq = 1;
+
+  // Wall-clock timestamp at send. Not used for ordering; only for diagnostics.
+  uint64 ts_unix_ns = 2;
+
+  oneof payload {
+    // ----- Control plane (Supervisor ↔ API, Supervisor ↔ Worker) -----
+    HeartbeatPing       heartbeat_ping       = 10;
+    HeartbeatPong       heartbeat_pong       = 11;
+    WorkerReady         worker_ready         = 12;
+    WorkerLost          worker_lost          = 13;
+    WorkerPromote       worker_promote       = 14;
+    BackendStateChange  backend_state_change = 15;
+    Shutdown            shutdown             = 16;
+
+    // ----- Data plane (API ↔ Worker) -----
+    InferenceJob        inference_job        = 30;
+    InferenceTokenBatch inference_tokens     = 31;
+    InferenceDone       inference_done       = 32;
+    InferenceError      inference_error      = 33;
+    InferenceCancel     inference_cancel     = 34;
+  }
+}
+
+// =====================================================================
+// Control plane messages
+// =====================================================================
+
+// Sent every 500 ms from Supervisor to each child. Children must respond
+// with HeartbeatPong within 250 ms; three consecutive misses → child
+// considered dead, supervisor begins recovery.
+message HeartbeatPing {
+  uint64 nonce = 1;
+}
+
+message HeartbeatPong {
+  uint64 nonce = 1;          // echo of ping's nonce
+  WorkerStats stats = 2;     // piggybacked health info
+}
+
+message WorkerStats {
+  uint64 rss_bytes        = 1;
+  uint64 vram_bytes       = 2;
+  uint32 in_flight_jobs   = 3;
+  uint32 kv_cache_pages   = 4;
+  string active_backend   = 5;  // "qnn-npu", "ane", "metal-gpu", etc.
+}
+
+// Sent by a freshly-spawned worker once model weights are loaded and the
+// active backend is initialized. Until this lands, the API server returns
+// 503 to clients.
+message WorkerReady {
+  string worker_id          = 1;
+  string active_backend     = 2;
+  uint32 max_concurrent     = 3;   // worker-local concurrency limit, usually 4
+  repeated string available_backends = 4;
+}
+
+// Supervisor → API Server: the worker on this IPC channel has died.
+// Carries the in-flight job IDs so the API server can decide whether to
+// retry, resume, or surface an error to each client.
+message WorkerLost {
+  string worker_id = 1;
+  enum ExitReason {
+    UNKNOWN              = 0;
+    SEGFAULT             = 1;   // SIGSEGV / STATUS_ACCESS_VIOLATION
+    OOM                  = 2;   // SIGKILL by OOM killer / job-object low-mem
+    BACKEND_FAULT        = 3;   // NPU/ANE driver returned fatal
+    GRACEFUL             = 4;   // shutdown requested
+    HEARTBEAT_TIMEOUT    = 5;
+  }
+  ExitReason reason       = 2;
+  int32 exit_code         = 3;
+  repeated string in_flight_request_ids = 4;
+  string crash_dump_path  = 5;  // optional; written async by supervisor
+}
+
+// Supervisor → API Server: a new worker has taken over. Includes the new
+// IPC handle (passed out-of-band via SCM_RIGHTS on macOS / DuplicateHandle
+// on Windows; the bytes here are only an identifier).
+message WorkerPromote {
+  string worker_id        = 1;
+  string ipc_handle_id    = 2;  // opaque; the OS handle is passed separately
+  string active_backend   = 3;
+}
+
+// Supervisor → API Server: a hardware backend's circuit-breaker state
+// changed. The API server uses this to decide if a request that just
+// arrived should be routed straight to the fallback.
+message BackendStateChange {
+  string backend_name = 1;       // "qnn-npu", "ane", "metal-gpu", ...
+  enum State {
+    CLOSED    = 0;
+    OPEN      = 1;
+    HALF_OPEN = 2;
+  }
+  State new_state         = 2;
+  string reason           = 3;
+  uint32 retry_at_unix_s  = 4;   // only set for OPEN → HALF_OPEN transition
+}
+
+// Sent in either direction. Graceful: drain in-flight first; immediate:
+// hard exit.
+message Shutdown {
+  bool immediate = 1;
+}
+
+// =====================================================================
+// Data plane messages
+// =====================================================================
+
+// API Server → Worker
+message InferenceJob {
+  string request_id   = 1;
+  string mfe_id       = 2;
+  string prompt       = 3;
+  uint32 max_tokens   = 4;
+  float temperature   = 5;
+  float top_p         = 6;
+  repeated string stop_sequences = 7;
+  bool stream         = 8;
+  uint32 priority     = 9;        // 0 = background, 1 = user
+  string idempotency_key = 10;    // optional
+  uint64 deadline_unix_ms = 11;   // queue+run deadline; worker drops if past
+  optional int64 seed = 12;
+}
+
+// Worker → API Server. Tokens are batched (default 8 per frame) to amortize
+// IPC overhead without sacrificing perceptible latency. The receiver may
+// emit them to SSE individually.
+message InferenceTokenBatch {
+  string request_id = 1;
+  repeated Token tokens = 2;
+
+  message Token {
+    string text      = 1;
+    uint32 index     = 2;
+    optional float logprob = 3;
+  }
+}
+
+// Terminal success
+message InferenceDone {
+  string request_id      = 1;
+  enum FinishReason {
+    UNKNOWN = 0;
+    STOP    = 1;
+    LENGTH  = 2;
+    CANCELLED = 3;
+  }
+  FinishReason finish_reason = 2;
+  uint32 prompt_tokens       = 3;
+  uint32 completion_tokens   = 4;
+  uint32 ms_first_token      = 5;
+  uint32 ms_total            = 6;
+  string backend_used        = 7;
+}
+
+// Terminal error from the worker. The API server translates the worker
+// error code into the appropriate HTTP status + ErrorEnvelope code.
+message InferenceError {
+  string request_id      = 1;
+  enum WorkerErrorCode {
+    UNKNOWN_ERROR       = 0;
+    BACKEND_FATAL       = 1;   // NPU device removed, ANE driver crashed
+    BACKEND_TRANSIENT   = 2;   // timeout, OOM on accelerator
+    PROMPT_TOO_LONG     = 3;
+    INVALID_PARAMS      = 4;
+    DEADLINE_EXCEEDED   = 5;
+    MID_STREAM_CRASH    = 6;   // only emitted by the supervisor on behalf
+                               // of a dead worker
+  }
+  WorkerErrorCode code   = 2;
+  string message         = 3;
+  uint32 tokens_emitted_before_error = 4;  // for resume_token computation
+  optional string suggested_fallback_backend = 5;
+}
+
+// API Server → Worker. Client cancelled the request; free the slot.
+message InferenceCancel {
+  string request_id = 1;
+  string reason     = 2;  // "client", "timeout", "scheduler"
+}

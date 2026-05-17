@@ -1,0 +1,12 @@
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Mermaid rendered output (regenerate from .mmd as needed)
+diagrams/*.svg
+diagrams/*.png

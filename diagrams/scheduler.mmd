@@ -1,0 +1,42 @@
+%% Scheduler architecture — companion to PDF Figure 6
+
+flowchart TB
+    subgraph SUBQ[Submission - per MFE × 2 priorities]
+        Q1[Doc Q&A · user<br/>FIFO, weight 1.0]
+        Q2[Doc Q&A · background<br/>FIFO, weight 0.25]
+        Q3[Meeting · user<br/>FIFO, weight 1.0]
+        Q4[Meeting · background<br/>FIFO, weight 0.25]
+    end
+
+    CORE[<b>SCHEDULER CORE</b><br/>Weighted Deficit Round-Robin<br/>4 active slots · priority aging<br/><i>on slot release → pick highest deficit queue → dequeue head → dispatch</i>]
+
+    Q1 --> CORE
+    Q2 --> CORE
+    Q3 --> CORE
+    Q4 --> CORE
+
+    subgraph SLOTS[In-flight slot map - max 4]
+        S0[Slot 0<br/>Meeting · streaming]
+        S1[Slot 1<br/>Doc Q&A · user]
+        S2[Slot 2<br/>Meeting · bg prefetch]
+        S3[Slot 3<br/>idle]
+    end
+
+    CORE --> S0
+    CORE --> S1
+    CORE --> S2
+    CORE -.-> S3
+
+    AGENT[Edge Agent<br/>loopback HTTP]
+    S0 --> AGENT
+    S1 --> AGENT
+    S2 --> AGENT
+
+    subgraph INV[INVARIANTS]
+        I1[≤ 4 slots in use globally]
+        I2[≤ 3 slots per MFE]
+        I3[user >> background, ratio 4:1]
+        I4[age boost: +1 weight per 5s queued]
+        I5[cancellation: AbortSignal cascades]
+        I6[queue cap: 32 per MFE]
+    end

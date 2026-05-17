@@ -1,0 +1,21 @@
+%% Per-device circuit breaker — companion to PDF Figure 4 (state machine)
+
+stateDiagram-v2
+    [*] --> CLOSED
+
+    CLOSED: CLOSED<br/>use NPU
+    OPEN: OPEN<br/>CPU fallback only
+    HALF_OPEN: HALF-OPEN<br/>run probe-graph
+
+    CLOSED --> OPEN: fatal error<br/>(ERROR_DEVICE_REMOVED)
+    OPEN --> HALF_OPEN: 30s timer<br/>(doubles each cycle, cap 30min)
+    HALF_OPEN --> CLOSED: probe passes ×3
+    HALF_OPEN --> OPEN: probe fails
+
+    note right of HALF_OPEN
+        Probe details:
+        - 8-token prefill on dedicated probe-graph
+        - 60 ms budget
+        - must return correct fixed-output tensor
+        - guards against zombie driver
+    end note

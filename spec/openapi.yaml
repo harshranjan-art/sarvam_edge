@@ -1,0 +1,484 @@
+openapi: 3.1.0
+info:
+  title: Sarvam Edge Agent — Local HTTP API
+  version: 0.1.0-design
+  description: |
+    HTTP + SSE API exposed by the Edge Agent on `127.0.0.1`. Consumed by the
+    shell-owned SDK; not intended for direct MFE use.
+
+    **Transport.** HTTP/1.1 over TCP loopback only. The agent never binds
+    `0.0.0.0`. TLS is not used; the loopback boundary plus token authentication
+    is the trust model.
+
+    **Streaming.** Server-Sent Events. The client sends `Accept: text/event-stream`;
+    the server keeps the connection open and emits typed events.
+
+    **Authentication.** Bearer token issued by the Supervisor at agent startup
+    and mirrored to the OS keychain. The shell SDK fetches it via a native
+    helper. Tokens are revoked when the agent restarts; clients must re-handshake.
+
+  contact:
+    name: Edge Runtime Submission
+    url: https://github.com/[your-handle]/sarvam-edge-design
+
+servers:
+  - url: http://127.0.0.1:{port}
+    variables:
+      port:
+        default: "7321"
+        description: |
+          Port is dynamically assigned at agent startup and discovered by the
+          shell via the native helper. 7321 is the default fallback.
+
+# ----------------------------------------------------------------
+# Paths
+# ----------------------------------------------------------------
+paths:
+  /v1/inference:
+    post:
+      summary: Submit an inference request
+      description: |
+        The single endpoint for all inference. Non-streaming returns a JSON body;
+        streaming returns an SSE stream. The mode is chosen by the `Accept`
+        header AND the `stream` field in the body; they must agree.
+      operationId: createInference
+      tags: [inference]
+
+      parameters:
+        - $ref: "#/components/parameters/Origin"
+        - $ref: "#/components/parameters/Authorization"
+        - $ref: "#/components/parameters/XMFEId"
+        - $ref: "#/components/parameters/XPriority"
+        - $ref: "#/components/parameters/XRequestId"
+        - $ref: "#/components/parameters/XIdempotencyKey"
+        - $ref: "#/components/parameters/XDataResidency"
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/InferenceRequest" }
+            examples:
+              streaming-user:
+                summary: User-priority streaming query
+                value:
+                  model: sarvam-7b-indic
+                  prompt: "What does this paragraph say?\n\n[...]"
+                  max_tokens: 512
+                  stream: true
+                  stop: ["\n\n"]
+              background-prefetch:
+                summary: Background prefetch (lower priority)
+                value:
+                  model: sarvam-7b-indic
+                  prompt: "Summarise: [...]"
+                  max_tokens: 128
+                  stream: false
+
+      responses:
+        "200":
+          description: Success. Body shape depends on `stream`.
+          headers:
+            X-Edge-Backend:    { $ref: "#/components/headers/XEdgeBackend" }
+            X-Edge-Worker-Id:  { $ref: "#/components/headers/XEdgeWorkerId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InferenceResponse" }
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Sequence of SSE events. See `events.ts` for typed payloads.
+                  Event ordering: `queued?` → `position_update*` → `dispatched`
+                  → (`token` | `degraded`)* → (`done` | `error` | `cancelled`).
+
+        "401":
+          description: Bad or missing session token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+              example:
+                error:
+                  code: BAD_TOKEN
+                  message: Session token missing or expired
+                  recoverable: true
+                  request_id: req_8f2a3c91
+
+        "403":
+          description: Origin not on enterprise allowlist
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+              example:
+                error:
+                  code: ORIGIN_NOT_ALLOWED
+                  message: Origin https://other-app.tld is not on the MDM allowlist
+                  recoverable: false
+                  request_id: req_8f2a3c91
+
+        "409":
+          description: Duplicate idempotency key currently in flight
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+        "429":
+          description: All inference slots are in use and the queue is full
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Suggested seconds to wait
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+              example:
+                error:
+                  code: AGENT_AT_CAPACITY
+                  message: All inference slots in use; queue is full
+                  recoverable: true
+                  retry_after_ms: 1200
+                  request_id: req_8f2a3c91
+
+        "503":
+          description: Worker unavailable (warm pool exhausted; cold restart in progress)
+          headers:
+            Retry-After:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+              example:
+                error:
+                  code: WORKER_UNAVAILABLE
+                  message: No worker available; cold restart in progress
+                  recoverable: true
+                  retry_after_ms: 2500
+                  request_id: req_8f2a3c91
+
+        "507":
+          description: All accelerators failed; running on degraded backend
+          headers:
+            X-Edge-Backend:
+              schema: { type: string }
+              description: The degraded backend that served this response
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/InferenceResponse" }
+
+  /v1/inference/resume:
+    post:
+      summary: Resume a request that died mid-stream
+      description: |
+        After a `WORKER_CRASHED_MID_STREAM` error, the client may submit a
+        resume request with the original prompt, the tokens already received,
+        and the `resume_token` from the error event. The agent reconstructs the
+        prefill from `prompt + tokens_so_far` and continues from there.
+
+        This is **not** a true KV-cache resume; the cache is gone with the
+        crashed worker. It is a re-prefill on a longer prompt, which the
+        agent times accordingly.
+
+      operationId: resumeInference
+      tags: [inference]
+
+      parameters:
+        - $ref: "#/components/parameters/Authorization"
+        - $ref: "#/components/parameters/XMFEId"
+        - $ref: "#/components/parameters/XRequestId"
+
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ResumeRequest" }
+
+      responses:
+        "200":
+          description: Resume accepted; behaves like a fresh streaming request
+          content:
+            text/event-stream:
+              schema: { type: string }
+        "410":
+          description: |
+            `resume_token` is no longer valid (older than 60 s, or the agent
+            has restarted since the crash)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /v1/healthz:
+    get:
+      summary: Agent health
+      operationId: getHealth
+      tags: [meta]
+      responses:
+        "200":
+          description: Healthy. JSON body contains backend status.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthResponse" }
+        "503":
+          description: Unhealthy (e.g. cascading crash, worker pool exhausted)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthResponse" }
+
+  /v1/capabilities:
+    get:
+      summary: Agent capabilities snapshot
+      description: |
+        Returns the model loaded, the backends currently available (live
+        circuit-breaker state), and the agent version. Used by the shell SDK
+        on startup and after any `degraded` event to recompute the routing
+        plan.
+      operationId: getCapabilities
+      tags: [meta]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Capabilities" }
+
+# ----------------------------------------------------------------
+# Components
+# ----------------------------------------------------------------
+components:
+
+  parameters:
+    Origin:
+      name: Origin
+      in: header
+      required: true
+      description: Browser origin; must be on the enterprise allowlist
+      schema: { type: string, format: uri }
+
+    Authorization:
+      name: Authorization
+      in: header
+      required: true
+      description: "`Bearer <session-token>`"
+      schema: { type: string }
+
+    XMFEId:
+      name: X-MFE-Id
+      in: header
+      required: true
+      description: |
+        MFE identifier in `name@semver` form. Used by the scheduler for
+        fairness; not a security boundary.
+      schema:
+        type: string
+        pattern: "^[a-z0-9-]+@[0-9]+\\.[0-9]+\\.[0-9]+$"
+        example: doc-qa@2.4.0
+
+    XPriority:
+      name: X-Priority
+      in: header
+      required: false
+      description: |
+        Request priority. `user` is for foreground requests the user is
+        actively waiting on; `background` is for prefetch and speculative
+        work. Defaults to `user`.
+      schema:
+        type: string
+        enum: [user, background]
+        default: user
+
+    XRequestId:
+      name: X-Request-Id
+      in: header
+      required: true
+      description: |
+        Client-generated UUIDv4 or `req_` prefixed ULID. Echoed in every
+        SSE event and error envelope. Used to correlate logs and crashdumps.
+      schema:
+        type: string
+        example: req_8f2a3c91
+
+    XIdempotencyKey:
+      name: X-Idempotency-Key
+      in: header
+      required: false
+      description: |
+        Optional. If set, the SDK may auto-retry the request on recoverable
+        errors. If two requests with the same key are submitted concurrently,
+        the second receives `409 DUPLICATE_IDEMPOTENCY_KEY`. Keys expire
+        after 60 s.
+      schema: { type: string }
+
+    XDataResidency:
+      name: X-Data-Residency
+      in: header
+      required: false
+      description: |
+        `on-device` forbids cloud fallback for this request even if the
+        admin policy would allow it. Useful for high-sensitivity data.
+      schema:
+        type: string
+        enum: [on-device, any]
+
+  headers:
+    XEdgeBackend:
+      schema: { type: string, enum: [qnn-npu, ane, metal-gpu, cpu-onnxrt, cpu-accelerate, cloud] }
+      description: The backend that actually served this response.
+    XEdgeWorkerId:
+      schema: { type: string }
+      description: Worker process ID that handled this request.
+
+  schemas:
+
+    InferenceRequest:
+      type: object
+      required: [model, prompt]
+      properties:
+        model:
+          type: string
+          enum: [sarvam-7b-indic]
+        prompt:
+          type: string
+          minLength: 1
+          maxLength: 32768
+        max_tokens:
+          type: integer
+          minimum: 1
+          maximum: 4096
+          default: 256
+        stream:
+          type: boolean
+          default: false
+        temperature:
+          type: number
+          minimum: 0
+          maximum: 2
+          default: 0.7
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.95
+        stop:
+          type: array
+          items: { type: string }
+          maxItems: 8
+        seed:
+          type: integer
+          description: For reproducibility. Optional.
+
+    InferenceResponse:
+      type: object
+      required: [request_id, completion, usage]
+      properties:
+        request_id: { type: string }
+        completion:
+          type: string
+          description: The generated text.
+        finish_reason:
+          type: string
+          enum: [stop, length, error]
+        usage:
+          type: object
+          properties:
+            prompt_tokens:     { type: integer }
+            completion_tokens: { type: integer }
+            ms_first_token:    { type: integer }
+            ms_total:          { type: integer }
+        backend:
+          type: string
+          description: Same value as `X-Edge-Backend` header.
+
+    ResumeRequest:
+      type: object
+      required: [resume_token, original_prompt, tokens_so_far]
+      properties:
+        resume_token:
+          type: string
+          description: From the `WORKER_CRASHED_MID_STREAM` error event
+        original_prompt:
+          type: string
+        tokens_so_far:
+          type: string
+          description: The text already streamed to the client
+
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, recoverable, request_id]
+          properties:
+            code:
+              type: string
+              enum:
+                - BAD_TOKEN
+                - ORIGIN_NOT_ALLOWED
+                - DUPLICATE_IDEMPOTENCY_KEY
+                - AGENT_AT_CAPACITY
+                - WORKER_UNAVAILABLE
+                - WORKER_CRASHED_RETRY
+                - WORKER_CRASHED_MID_STREAM
+                - DEVICE_UNAVAILABLE_DEGRADED
+                - QUEUE_TIMEOUT
+                - RUN_TIMEOUT
+                - QUEUE_FULL
+                - WORKER_BINARY_MISSING
+                - INTERNAL_ERROR
+            message:    { type: string }
+            recoverable: { type: boolean }
+            retry_after_ms:
+              type: integer
+              description: Only set if `recoverable: true`
+            resume_token:
+              type: string
+              description: Only set for `WORKER_CRASHED_MID_STREAM`
+            request_id: { type: string }
+
+    HealthResponse:
+      type: object
+      required: [status, uptime_seconds, worker_pool]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        uptime_seconds: { type: integer }
+        worker_pool:
+          type: object
+          properties:
+            active:    { type: integer }
+            warm:      { type: integer }
+            launching: { type: integer }
+        backends:
+          type: object
+          additionalProperties:
+            type: object
+            properties:
+              available: { type: boolean }
+              circuit_state:
+                type: string
+                enum: [closed, open, half_open]
+              last_failure_ms_ago: { type: integer }
+
+    Capabilities:
+      type: object
+      required: [agent_version, model, backends]
+      properties:
+        agent_version:  { type: string }
+        api_version:    { type: string, example: "1.0" }
+        model:
+          type: object
+          properties:
+            id:           { type: string }
+            context_size: { type: integer }
+            quantization: { type: string }
+        backends:
+          type: array
+          items:
+            type: object
+            properties:
+              name:               { type: string }
+              available:          { type: boolean }
+              expected_latency_factor: { type: number }
+        max_concurrent_requests:
+          type: integer
+          example: 4

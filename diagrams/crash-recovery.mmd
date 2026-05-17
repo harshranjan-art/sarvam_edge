@@ -1,0 +1,43 @@
+%% Crash recovery sequence — companion to PDF Figure 3
+
+sequenceDiagram
+    autonumber
+    participant Client
+    participant API as API Server
+    participant Sup as Supervisor
+    participant WA as Worker A (active)
+    participant WB as Worker B (warm)
+
+    Note over Client,WB: Steady state: Worker A streaming a request to Client
+
+    WA-xWA: SIGSEGV / STATUS_ACCESS_VIOLATION
+    Note right of WA: T+0
+
+    Sup-->>Sup: kqueue / JobObject notifies of exit
+    Note right of Sup: T+20ms — capture exit code
+
+    Sup->>API: WorkerLost(worker_id, [in_flight_ids])
+    Sup->>API: WorkerPromote(Worker_B)
+    Note right of Sup: T+30-80ms
+
+    API-->>API: consult retry policy per request
+    Note right of API: T+80-150ms
+
+    alt non-streaming, idempotent
+        API->>WB: re-dispatch InferenceJob
+        WB-->>API: InferenceDone
+        API-->>Client: 200 OK (client never saw an error)
+    else streaming, 0 tokens emitted
+        API->>WB: re-dispatch InferenceJob
+        API->>Client: event: retry
+        WB-->>API: InferenceTokenBatch (resumed)
+        API->>Client: event: token (normal)
+    else streaming, ≥1 token emitted
+        API->>Client: event: error<br/>{ code: "WORKER_CRASHED_MID_STREAM",<br/>  recoverable: true,<br/>  resume_token: ... }
+        Note over Client: Client may POST /v1/inference/resume
+    end
+
+    Note right of WB: T+280ms — first token from Worker B
+
+    Sup->>Sup: spawn replacement warm worker
+    Note right of Sup: T+500ms — write crashdump async (5/min rate limit)
