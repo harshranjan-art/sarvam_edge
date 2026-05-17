@@ -154,5 +154,4 @@ page of the PDF.
 
 ---
 
-*Last updated: May 2025. Submitted as part of the Sarvam AI Edge Runtime
-backend intern application.*
+
